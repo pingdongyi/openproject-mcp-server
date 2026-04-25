@@ -107,6 +107,7 @@ This MCP server can be deployed in two ways:
 
 1. **Local (stdio)**: Run on your local machine for personal use
 2. **Cloud (SSE)**: Deploy to FastMCP Cloud for team/organization access
+3. **Docker (HTTP)**: Self-hosted HTTP server with multi-user API key auth
 
 ### Option 1: Local Deployment (stdio)
 
@@ -313,6 +314,66 @@ Deploy to FastMCP Cloud for centralized access across your organization. This el
 - [Quick Start Guide](QUICK_START_CLOUD.md) - Fast setup in 5 minutes
 - [FastMCP Cloud Deployment Guide (English)](FASTMCP_CLOUD_DEPLOYMENT.md) - Comprehensive guide
 - [Hướng dẫn kết nối Cloud (Tiếng Việt)](HUONG_DAN_KET_NOI_CLOUD.md) - Vietnamese guide
+
+### Option 3: Docker Deployment (HTTP)
+
+Deploy as a self-hosted HTTP server with multi-user API key authentication. Ideal for team environments where multiple users connect to a single MCP instance.
+
+**Prerequisites:**
+- Docker and Docker Compose installed
+
+**Quick Start:**
+
+1. **Create `.env` file:**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your OpenProject credentials
+   ```
+
+2. **Build and run:**
+   ```bash
+   docker compose up -d
+   ```
+
+3. **Verify the container is running:**
+   ```bash
+   docker compose ps
+   ```
+
+**Multi-user setup:**
+
+Set `MCP_API_KEYS` in your `.env` to enable per-user API key authentication:
+
+```env
+MCP_API_KEYS=key1:Alice,key2:Bob,key3:Charlie
+```
+
+Each user connects with their Bearer token (e.g., `Authorization: Bearer key1`).
+
+**Custom port:**
+
+```env
+MCP_HTTP_PORT=9000
+```
+
+**Manual Docker build (without compose):**
+
+```bash
+docker build -t openproject-mcp-server .
+docker run -d \
+  --name openproject-mcp \
+  -p 8000:8000 \
+  -e OPENPROJECT_URL=https://your-instance.openproject.com \
+  -e OPENPROJECT_API_KEY=your-api-key \
+  -e MCP_API_KEYS=key1:Alice,key2:Bob \
+  openproject-mcp-server
+```
+
+**Stopping the container:**
+
+```bash
+docker compose down
+```
 
 For comprehensive deployment instructions, troubleshooting, and best practices, see the guides above.
 
