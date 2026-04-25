@@ -875,8 +875,8 @@ async def list_work_package_activities(work_package_id: int) -> str:
                 comment_raw = comment_data.get("raw", "")
                 if comment_raw:
                     # Truncate long comments
-                    comment_preview = comment_raw[:150]
-                    if len(comment_raw) > 150:
+                    comment_preview = comment_raw[:2000]
+                    if len(comment_raw) > 2000:
                         comment_preview += "..."
                     text += f"  Comment: {comment_preview}\n"
 
