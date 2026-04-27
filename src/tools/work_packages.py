@@ -387,6 +387,37 @@ async def search_work_packages(
 
 
 @mcp.tool
+async def get_work_package(work_package_id: int) -> str:
+    """Get detailed information about a specific work package by ID.
+
+    Use this tool when you need the main details for a single task, including
+    subject, type, status, priority, project, assignee, dates, description,
+    and progress.
+
+    Args:
+        work_package_id: The unique ID of the work package to retrieve
+
+    Returns:
+        Formatted work package details
+
+    Example:
+        To get details for work package #123:
+        {
+            "work_package_id": 123
+        }
+    """
+    try:
+        client = get_client()
+
+        result = await client.get_work_package(work_package_id)
+
+        return format_work_package_detail(result)
+
+    except Exception as e:
+        return format_error(f"Failed to get work package #{work_package_id}: {str(e)}")
+
+
+@mcp.tool
 async def create_work_package(input: CreateWorkPackageInput) -> str:
     """Create a new work package (task) - CRITICAL tool for creating tasks.
 
@@ -1490,5 +1521,3 @@ async def list_work_packages_nearly_complete(
         
     except Exception as e:
         return format_error(f"Failed to list nearly complete work packages: {str(e)}")
-
-

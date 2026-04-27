@@ -6,9 +6,13 @@ Main server file that initializes FastMCP and registers all tools.
 
 import os
 import logging
+import ast
+import pkgutil
+from importlib import import_module
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
+import src.tools
 from src.client import OpenProjectClient
 
 # Load environment variables
@@ -63,24 +67,60 @@ def get_client():
 # Import ALL tool modules (decorators auto-register tools)
 logger.info("Loading tool modules...")
 
+
+def _discover_tool_modules():
+    """Discover tool modules from the src.tools package."""
+    return sorted(
+        module_info.name
+        for module_info in pkgutil.iter_modules(src.tools.__path__)
+        if not module_info.ispkg
+    )
+
+
+def _is_mcp_tool_decorator(decorator):
+    """Return True for @mcp.tool and @mcp.tool(...)."""
+    candidate = decorator.func if isinstance(decorator, ast.Call) else decorator
+    return (
+        isinstance(candidate, ast.Attribute)
+        and candidate.attr == "tool"
+        and isinstance(candidate.value, ast.Name)
+        and candidate.value.id == "mcp"
+    )
+
+
+def _collect_tool_names(module):
+    """Collect MCP tool function names from a tool module's source code."""
+    source_path = getattr(module, "__file__", None)
+    if not source_path:
+        return []
+
+    with open(source_path, encoding="utf-8") as source_file:
+        tree = ast.parse(source_file.read(), filename=source_path)
+
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(_is_mcp_tool_decorator(decorator) for decorator in node.decorator_list)
+    ]
+
 try:
-    # Phase 1: Priority tools (7 tools)
-    from src.tools import connection      # 2 tools: test_connection, check_permissions
-    from src.tools import work_packages   # 7 tools: list, create, update, delete, list_types, list_statuses, list_priorities
-    from src.tools import projects        # 5 tools: list, get, create, update, delete
+    tools_by_module = {}
+    for module_name in _discover_tool_modules():
+        module = import_module(f"src.tools.{module_name}")
+        tool_names = _collect_tool_names(module)
+        if tool_names:
+            tools_by_module[module_name] = tool_names
 
-    # Phase 2: Additional tools (28 tools)
-    from src.tools import users           # 6 tools: list_users, get_user, list_roles, get_role, list_project_members, list_user_projects
-    from src.tools import memberships     # 5 tools: list, get, create, update, delete
-    from src.tools import hierarchy       # 3 tools: set_parent, remove_parent, list_children
-    from src.tools import relations       # 5 tools: create, list, get, update, delete
-    from src.tools import time_entries    # 5 tools: list, create, update, delete, list_activities
-    from src.tools import versions        # 2 tools: list, create
-    from src.tools import weekly_reports   # 4 tools: generate_weekly_report, get_report_data, generate_this_week_report, generate_last_week_report
-    from src.tools import news             # 5 tools: list_news, create_news, get_news, update_news, delete_news
-
-    logger.info("✅ All 49 tool modules loaded successfully")
+    total_tools = sum(len(tool_names) for tool_names in tools_by_module.values())
+    logger.info("✅ All %s tools loaded successfully", total_tools)
+    for module_name, tool_names in tools_by_module.items():
+        logger.info(
+            "   %s (%s): %s",
+            module_name,
+            len(tool_names),
+            ", ".join(tool_names),
+        )
 except ImportError as e:
     logger.warning(f"⚠️  Some tool modules failed to import: {e}")
     raise
-
