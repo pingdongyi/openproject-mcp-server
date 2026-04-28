@@ -8,11 +8,13 @@ Includes API Key authentication for user tracking.
 
 import os
 from src.server import mcp
-from src.auth import load_api_keys_from_env
+from src.auth import APIKeyAuthProvider, load_api_keys_from_env
 
 if __name__ == "__main__":
     # Load API keys for authentication
     api_keys = load_api_keys_from_env()
+    if api_keys:
+        mcp.auth = APIKeyAuthProvider(api_keys)
 
     # Get host and port from environment
     host = os.getenv("MCP_HTTP_HOST", "0.0.0.0")

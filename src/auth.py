@@ -1,7 +1,10 @@
 """Authentication middleware for HTTP transport."""
 
 import os
+import secrets
 from typing import Dict, Optional
+
+from fastmcp.server.auth import AccessToken, TokenVerifier
 
 
 class APIKeyAuth:
@@ -30,7 +33,30 @@ class APIKeyAuth:
         Returns:
             User name if valid, None otherwise
         """
-        return self.valid_keys.get(api_key)
+        for valid_key, user_name in self.valid_keys.items():
+            if secrets.compare_digest(api_key, valid_key):
+                return user_name
+        return None
+
+
+class APIKeyAuthProvider(TokenVerifier):
+    """FastMCP bearer token verifier backed by configured API keys."""
+
+    def __init__(self, valid_keys: Dict[str, str]):
+        super().__init__()
+        self.api_key_auth = APIKeyAuth(valid_keys)
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Return an access token when the bearer token is configured."""
+        user_name = self.api_key_auth.validate(token)
+        if not user_name:
+            return None
+
+        return AccessToken(
+            token=token,
+            client_id=user_name,
+            scopes=[],
+        )
 
 
 def load_api_keys_from_env() -> Dict[str, str]:
