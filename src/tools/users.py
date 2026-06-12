@@ -1,8 +1,40 @@
 """User and role management tools."""
 
+import json
 from typing import Optional
+
+from src.client import OpenProjectAPIError
 from src.server import mcp, get_client
 from src.utils.formatting import format_success, format_error
+
+
+PRINCIPAL_STATUS_IDS = {
+    "active": "1",
+    "registered": "2",
+    "locked": "3",
+    "invited": "4",
+}
+
+
+def _principal_filters(name: Optional[str], status: Optional[str]) -> list[dict]:
+    """Build filters for the permission-safe principals fallback."""
+    filters = [{"type": {"operator": "=", "values": ["User"]}}]
+
+    if name:
+        filters.append(
+            {"any_name_attribute": {"operator": "~", "values": [name]}}
+        )
+    if status:
+        status_id = PRINCIPAL_STATUS_IDS.get(status.lower())
+        if status_id is None:
+            supported = ", ".join(PRINCIPAL_STATUS_IDS)
+            raise ValueError(
+                f"Unsupported status '{status}' for limited user lookup. "
+                f"Supported statuses: {supported}."
+            )
+        filters.append({"status": {"operator": "=", "values": [status_id]}})
+
+    return filters
 
 
 @mcp.tool
@@ -25,16 +57,41 @@ async def list_users(name: Optional[str] = None, status: Optional[str] = None) -
         if status:
             filters.append({"status": {"operator": "=", "values": [status]}})
 
-        import json
         filters_json = json.dumps(filters) if filters else None
 
-        result = await client.get_users(filters_json)
+        limited_scope = False
+        try:
+            result = await client.get_users(filters_json)
+        except OpenProjectAPIError as e:
+            is_missing_permission = (
+                e.status == 403
+                and e.error_identifier
+                == "urn:openproject-org:api:v3:errors:MissingPermission"
+            )
+            if not is_missing_permission:
+                raise
+
+            fallback_filters = json.dumps(_principal_filters(name, status))
+            result = await client.get_principals(fallback_filters)
+            limited_scope = True
+
         users = result.get("_embedded", {}).get("elements", [])
 
         if not users:
+            if limited_scope:
+                return (
+                    "No visible users found. The API account cannot list all users; "
+                    "this lookup was limited to users in projects it can see."
+                )
             return "No users found."
 
-        text = f"✅ **Found {len(users)} user(s):**\n\n"
+        qualifier = " visible" if limited_scope else ""
+        text = f"✅ **Found {len(users)}{qualifier} user(s):**\n\n"
+        if limited_scope:
+            text += (
+                "_Limited result: the API account cannot list all OpenProject users. "
+                "Only users in projects visible to this account are shown._\n\n"
+            )
         for user in users:
             text += f"- **{user.get('name', 'Unknown')}** (ID: {user.get('id', 'N/A')})\n"
             text += f"  Email: {user.get('email', 'N/A')}\n"

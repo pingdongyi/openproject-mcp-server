@@ -22,6 +22,27 @@ logger = logging.getLogger(__name__)
 __version__ = "2.0.0"
 
 
+class OpenProjectAPIError(Exception):
+    """Error response returned by the OpenProject API."""
+
+    def __init__(self, status: int, response_text: str, message: str):
+        self.status = status
+        self.response_text = response_text
+        self.error_identifier = None
+        self.api_message = None
+
+        try:
+            response_json = json.loads(response_text) if response_text else {}
+        except json.JSONDecodeError:
+            response_json = {}
+
+        if isinstance(response_json, dict):
+            self.error_identifier = response_json.get("errorIdentifier")
+            self.api_message = response_json.get("message")
+
+        super().__init__(message)
+
+
 class OpenProjectClient:
     """Client for the OpenProject API v3 with optional proxy support"""
 
@@ -118,7 +139,9 @@ class OpenProjectClient:
                         error_msg = self._format_error_message(
                             response.status, response_text
                         )
-                        raise Exception(error_msg)
+                        raise OpenProjectAPIError(
+                            response.status, response_text, error_msg
+                        )
 
                     return response_json
 
@@ -330,6 +353,21 @@ class OpenProjectClient:
         result = await self._request("GET", endpoint)
 
         # Ensure proper response structure
+        if "_embedded" not in result:
+            result["_embedded"] = {"elements": []}
+        elif "elements" not in result.get("_embedded", {}):
+            result["_embedded"]["elements"] = []
+
+        return result
+
+    async def get_principals(self, filters: Optional[str] = None) -> Dict:
+        """Retrieve principals visible through the caller's projects."""
+        endpoint = "/principals"
+        if filters:
+            endpoint += f"?filters={quote(filters)}"
+
+        result = await self._request("GET", endpoint)
+
         if "_embedded" not in result:
             result["_embedded"] = {"elements": []}
         elif "elements" not in result.get("_embedded", {}):
@@ -1394,4 +1432,3 @@ class OpenProjectClient:
         """
         await self._request("DELETE", f"/news/{news_id}")
         return True
-

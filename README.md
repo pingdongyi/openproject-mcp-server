@@ -490,10 +490,13 @@ Create a new task in project 5 titled "Update documentation" with type ID 1
 ```
 
 #### 7. `list_users`
-List all users in the OpenProject instance.
+List users in the OpenProject instance. Listing every user requires sufficient
+OpenProject permissions. If access is denied, the tool falls back to users in
+projects visible to the API account and marks the result as limited.
 
 **Parameters:**
-- `active_only` (boolean, optional): Show only active users (default: true)
+- `name` (string, optional): Match part of a name, email address, or login
+- `status` (string, optional): Filter by status, such as `active` or `locked`
 
 #### 8. `get_user`
 Get detailed information about a specific user.
