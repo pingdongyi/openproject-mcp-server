@@ -14,6 +14,45 @@ os.environ.setdefault("OPENPROJECT_API_KEY", "api-key")
 
 
 class UserLookupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_current_user_uses_me_endpoint(self):
+        client = OpenProjectClient("https://example.test", "api-key")
+        captured = {}
+
+        async def fake_request(method, endpoint, data=None):
+            captured["method"] = method
+            captured["endpoint"] = endpoint
+            return {"id": 20, "name": "Pingdong Yi"}
+
+        client._request = fake_request
+
+        result = await client.get_current_user()
+
+        self.assertEqual(captured, {"method": "GET", "endpoint": "/users/me"})
+        self.assertEqual(result["id"], 20)
+
+    async def test_get_current_user_tool_formats_user(self):
+        from src.tools import users as users_module
+
+        class FakeClient:
+            async def get_current_user(self):
+                return {
+                    "id": 20,
+                    "name": "Pingdong Yi",
+                    "email": "pyi@example.com",
+                    "login": "pyi@example.com",
+                    "status": "active",
+                    "admin": False,
+                    "language": "en",
+                }
+
+        with patch.object(users_module, "get_client", return_value=FakeClient()):
+            result = await users_module.get_current_user.fn()
+
+        self.assertIn("Current User #20", result)
+        self.assertIn("Pingdong Yi", result)
+        self.assertIn("**Admin**: No", result)
+        self.assertIn("**Language**: en", result)
+
     async def test_get_principals_encodes_filters(self):
         client = OpenProjectClient("https://example.test", "api-key")
         captured = {}

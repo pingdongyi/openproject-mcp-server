@@ -387,6 +387,10 @@ class OpenProjectClient:
         """
         return await self._request("GET", f"/users/{user_id}")
 
+    async def get_current_user(self) -> Dict:
+        """Retrieve the user authenticated by the configured API key."""
+        return await self._request("GET", "/users/me")
+
     async def get_memberships(
         self, project_id: Optional[int] = None, user_id: Optional[int] = None
     ) -> Dict:
@@ -795,7 +799,7 @@ class OpenProjectClient:
         """
         try:
             # Get current user info which includes permissions
-            return await self._request("GET", "/users/me")
+            return await self.get_current_user()
         except Exception as e:
             logger.error(f"Failed to check permissions: {e}")
             return {}

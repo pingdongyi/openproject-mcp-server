@@ -498,6 +498,10 @@ projects visible to the API account and marks the result as limited.
 - `name` (string, optional): Match part of a name, email address, or login
 - `status` (string, optional): Filter by status, such as `active` or `locked`
 
+#### `get_current_user`
+Get the OpenProject user authenticated by the configured API key. This tool has
+no parameters and returns the current user's ID, profile, status, and admin flag.
+
 #### 8. `get_user`
 Get detailed information about a specific user.
 

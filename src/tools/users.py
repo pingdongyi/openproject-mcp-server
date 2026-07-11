@@ -108,6 +108,37 @@ async def list_users(name: Optional[str] = None, status: Optional[str] = None) -
 
 
 @mcp.tool
+async def get_current_user() -> str:
+    """Get the OpenProject user authenticated by the configured API key.
+
+    Returns:
+        Current user details
+    """
+    try:
+        client = get_client()
+        user = await client.get_current_user()
+
+        text = f"✅ **Current User #{user.get('id', 'N/A')}**\n\n"
+        text += f"**Name**: {user.get('name', 'Unknown')}\n"
+        text += f"**Email**: {user.get('email', 'N/A')}\n"
+        text += f"**Login**: {user.get('login', 'N/A')}\n"
+        text += f"**Status**: {user.get('status', 'N/A')}\n"
+        text += f"**Admin**: {'Yes' if user.get('admin') else 'No'}\n"
+
+        if user.get("language"):
+            text += f"**Language**: {user['language']}\n"
+        if user.get("createdAt"):
+            text += f"**Created**: {user['createdAt']}\n"
+        if user.get("updatedAt"):
+            text += f"**Updated**: {user['updatedAt']}\n"
+
+        return text
+
+    except Exception as e:
+        return format_error(f"Failed to get current user: {str(e)}")
+
+
+@mcp.tool
 async def get_user(user_id: int) -> str:
     """Get detailed information about a specific user.
 
