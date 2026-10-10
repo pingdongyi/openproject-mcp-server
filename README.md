@@ -908,6 +908,60 @@ Get detailed information about a specific work package relation.
 **Parameters:**
 - `relation_id` (integer, required): Relation ID
 
+### Attachment tools
+
+| Tool | Purpose |
+| --- | --- |
+| `list_work_package_attachments` | List attachment IDs, metadata and download links for a ticket. |
+| `upload_work_package_attachment` | Attach UTF-8 text or Base64 file contents to an existing ticket. |
+| `get_attachment` | Read an attachment's metadata and container. |
+| `download_attachment` | Return Base64 file bytes, size and SHA-256; optionally return only size/hash. |
+
+Uploads take an `input` object. Supply exactly one of `content` (UTF-8 text) or
+`content_base64` (standard Base64). No path on the MCP server is required.
+Uploads and downloads are limited to **10 MiB of decoded file bytes**; OpenProject
+may enforce a lower limit. These tools return structured JSON and report failures
+as MCP tool errors. Read tools are annotated read-only; upload creates an attachment
+and is not idempotent. List attachments before retrying an uncertain upload.
+
+Example: `upload_work_package_attachment`
+
+```json
+{
+  "input": {
+    "work_package_id": 24717,
+    "file_name": "ALSPC-24717_Treatment_Current_Exports.md",
+    "content": "# ALSPC-24717: Treatment Current exports\n\nTicket handoff.\n",
+    "content_type": "text/markdown",
+    "description": "Repository handoff document"
+  }
+}
+```
+
+`file_name` must be a basename, not a path. `content_type` and `description` are
+optional; MIME type is inferred from the filename. Text is encoded as UTF-8;
+use Base64 to preserve original encoding, line endings and binary file bytes.
+The upload response includes `attachment`, `uploaded_size_bytes` and
+`uploaded_sha256` (computed from the **sent** bytes). For verification, call
+`download_attachment` with the returned attachment ID and `include_content: false`;
+compare its `size_bytes` and `sha256` with the upload values or original file.
+
+The tools are discovered automatically by all FastMCP entry points. Restart or
+redeploy the running MCP server, then reconnect the MCP client to refresh its
+tool list. The legacy single-file entry point does not load these tools.
+
+The transport uses the
+[OpenProject attachment API](https://www.openproject.org/docs/api/endpoints/attachments/)
+with exactly two multipart parts: `metadata` has Content-Type
+`application/json` and contains one JSON object with `fileName` and optional
+`description`; `file` contains the original bytes, a filename and the file MIME type.
+
+Run the isolated attachment tests (local HTTP fixtures, no real API credentials):
+
+```bash
+uv run python -m unittest test_attachments -v
+```
+
 ## Development
 
 ### Setting up Development Environment

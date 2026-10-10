@@ -14,12 +14,29 @@ import aiohttp
 from urllib.parse import quote
 import base64
 import ssl
+import mimetypes
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Version information
 __version__ = "2.0.0"
+
+
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+
+
+def validate_attachment_filename(file_name: str) -> str:
+    """Accept a file name, never a path or multipart header control characters."""
+    if (
+        not file_name.strip()
+        or len(file_name) > 255
+        or file_name in {".", ".."}
+        or any(character in file_name for character in ("/", "\\"))
+        or any(ord(character) < 32 or ord(character) == 127 for character in file_name)
+    ):
+        raise ValueError("file_name must be a basename of 1-255 characters")
+    return file_name
 
 
 class OpenProjectAPIError(Exception):
@@ -77,22 +94,32 @@ class OpenProjectClient:
         return base64.b64encode(credentials.encode()).decode()
 
     async def _request(
-        self, method: str, endpoint: str, data: Optional[Dict] = None
-    ) -> Dict:
+        self,
+        method: str,
+        endpoint: str,
+        data: Optional[Dict] = None,
+        *,
+        multipart: Optional[aiohttp.FormData] = None,
+        binary: bool = False,
+    ) -> Any:
         """
         Execute an API request.
 
         Args:
             method: HTTP method (GET, POST, etc.)
             endpoint: API endpoint path
-            data: Optional request body data
+            data: Optional JSON request body data
+            multipart: Multipart body, instead of JSON (content is never logged)
+            binary: Return bytes, bounded by MAX_ATTACHMENT_BYTES
 
         Returns:
-            Dict: Response data from the API
+            API response data, or bytes when binary=True.
 
         Raises:
             Exception: If the request fails
         """
+        if multipart is not None and data is not None:
+            raise ValueError("JSON and multipart bodies cannot be combined")
         url = f"{self.base_url}/api/v3{endpoint}"
 
         logger.debug(f"API Request: {method} {url}")
@@ -109,18 +136,52 @@ class OpenProjectClient:
         ) as session:
             try:
                 # Build request parameters
+                headers = self.headers.copy()
+                if multipart is not None or binary:
+                    # aiohttp must set the multipart boundary itself.
+                    headers.pop("Content-Type", None)
+                if binary:
+                    headers["Accept"] = "application/octet-stream"
                 request_params = {
                     "method": method,
                     "url": url,
-                    "headers": self.headers,
-                    "json": data,
+                    "headers": headers,
                 }
+                if multipart is not None:
+                    request_params["data"] = multipart
+                    # Do not replay a non-idempotent upload on redirects.
+                    request_params["allow_redirects"] = False
+                else:
+                    request_params["json"] = data
 
                 # Add proxy if configured
                 if self.proxy:
                     request_params["proxy"] = self.proxy
 
                 async with session.request(**request_params) as response:
+                    if multipart is not None and 300 <= response.status < 400:
+                        raise OpenProjectAPIError(
+                            response.status,
+                            "",
+                            "Attachment upload redirected; "
+                            "check OPENPROJECT_URL and list attachments before retrying",
+                        )
+                    if binary and response.status < 400:
+                        if (
+                            response.content_length is not None
+                            and response.content_length > MAX_ATTACHMENT_BYTES
+                        ):
+                            raise ValueError(
+                                "Attachment exceeds the 10 MiB download limit"
+                            )
+                        payload = bytearray()
+                        async for chunk in response.content.iter_chunked(65536):
+                            if len(payload) + len(chunk) > MAX_ATTACHMENT_BYTES:
+                                raise ValueError(
+                                    "Attachment exceeds the 10 MiB download limit"
+                                )
+                            payload.extend(chunk)
+                        return bytes(payload)
                     response_text = await response.text()
 
                     logger.debug(f"Response status: {response.status}")
@@ -1436,3 +1497,64 @@ class OpenProjectClient:
         """
         await self._request("DELETE", f"/news/{news_id}")
         return True
+
+    async def list_work_package_attachments(self, work_package_id: int) -> Dict:
+        """Return the HAL attachment collection for an existing work package."""
+        if work_package_id <= 0:
+            raise ValueError("work_package_id must be positive")
+        return await self._request(
+            "GET", f"/work_packages/{work_package_id}/attachments"
+        )
+
+    async def get_attachment(self, attachment_id: int) -> Dict:
+        """Read attachment metadata, including container and downloadLocation."""
+        if attachment_id <= 0:
+            raise ValueError("attachment_id must be positive")
+        return await self._request("GET", f"/attachments/{attachment_id}")
+
+    async def upload_work_package_attachment(
+        self,
+        work_package_id: int,
+        file_name: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict:
+        """Upload bytes with application/json metadata and a binary multipart file."""
+        if work_package_id <= 0:
+            raise ValueError("work_package_id must be positive")
+        validate_attachment_filename(file_name)
+        if not content or len(content) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("Attachment must contain 1 byte to 10 MiB")
+        if content_type is None:
+            content_type = (
+                "text/markdown"
+                if file_name.lower().endswith(".md")
+                else mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+            )
+        metadata = {"fileName": file_name}
+        if description is not None:
+            metadata["description"] = {"format": "plain", "raw": description}
+        form = aiohttp.FormData()
+        # The metadata part contains one JSON object, as required by API v3.
+        form.add_field(
+            "metadata",
+            json.dumps(metadata, ensure_ascii=False),
+            content_type="application/json",
+        )
+        form.add_field("file", content, filename=file_name, content_type=content_type)
+        return await self._request(
+            "POST", f"/work_packages/{work_package_id}/attachments", multipart=form
+        )
+
+    async def download_attachment(self, attachment_id: int) -> bytes:
+        """Download bounded binary content through the authenticated API endpoint.
+
+        aiohttp follows storage redirects and strips Authorization across origins.
+        Caller-supplied download URLs are deliberately not accepted.
+        """
+        if attachment_id <= 0:
+            raise ValueError("attachment_id must be positive")
+        return await self._request(
+            "GET", f"/attachments/{attachment_id}/content", binary=True
+        )
