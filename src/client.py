@@ -1512,6 +1512,13 @@ class OpenProjectClient:
             raise ValueError("attachment_id must be positive")
         return await self._request("GET", f"/attachments/{attachment_id}")
 
+    async def delete_attachment(self, attachment_id: int) -> bool:
+        """Permanently delete an attachment; API errors propagate to the caller."""
+        if attachment_id <= 0:
+            raise ValueError("attachment_id must be positive")
+        await self._request("DELETE", f"/attachments/{attachment_id}")
+        return True
+
     async def upload_work_package_attachment(
         self,
         work_package_id: int,

@@ -154,3 +154,22 @@ async def download_attachment(
         return result
     except Exception as error:
         raise ToolError(f"Failed to download attachment: {error}") from error
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True
+    }
+)
+async def delete_attachment(attachment_id: PositiveId) -> Dict[str, Any]:
+    """Permanently delete an attachment by ID. This action cannot be undone.
+
+    Use list_work_package_attachments or get_attachment to identify the file.
+    Requires permission to delete attachments in its container. Deleting an
+    already missing attachment reports the API's 404 error.
+    """
+    try:
+        await get_client().delete_attachment(attachment_id)
+        return {"attachment_id": attachment_id, "deleted": True}
+    except Exception as error:
+        raise ToolError(f"Failed to delete attachment: {error}") from error

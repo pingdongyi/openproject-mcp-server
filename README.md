@@ -916,6 +916,7 @@ Get detailed information about a specific work package relation.
 | `upload_work_package_attachment` | Attach UTF-8 text or Base64 file contents to an existing ticket. |
 | `get_attachment` | Read an attachment's metadata and container. |
 | `download_attachment` | Return Base64 file bytes, size and SHA-256; optionally return only size/hash. |
+| `delete_attachment` | Permanently delete an attachment by ID. |
 
 Uploads take an `input` object. Supply exactly one of `content` (UTF-8 text) or
 `content_base64` (standard Base64). No path on the MCP server is required.
@@ -945,6 +946,14 @@ The upload response includes `attachment`, `uploaded_size_bytes` and
 `uploaded_sha256` (computed from the **sent** bytes). For verification, call
 `download_attachment` with the returned attachment ID and `include_content: false`;
 compare its `size_bytes` and `sha256` with the upload values or original file.
+
+To delete an attachment, call `delete_attachment` with `{"attachment_id": 42}`.
+Find the ID with `list_work_package_attachments` or inspect it with `get_attachment`
+first. Deletion is permanent and requires permission to delete attachments in the
+attachment's container. Success returns `{"attachment_id": 42, "deleted": true}`;
+permission failures and missing attachments are MCP tool errors. Deleting the same
+ID again reports a 404 error. The tool is annotated destructive and idempotent
+because repeating it has no additional effect on server state.
 
 The tools are discovered automatically by all FastMCP entry points. Restart or
 redeploy the running MCP server, then reconnect the MCP client to refresh its

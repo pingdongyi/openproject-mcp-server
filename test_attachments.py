@@ -43,6 +43,7 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.requests = []
         self.uploads = []
         self.storage_headers = []
+        self.deleted = False
         self.metadata = {
             "id": 42, "fileName": "handoff.md", "contentType": "text/markdown",
             "fileSize": len(self.payload),
@@ -94,10 +95,17 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             await response.write_eof()
             return response
         if tail == "attachments/42/content":
+            if self.deleted:
+                return web.json_response({"message": "Attachment not found"}, status=404)
             return web.Response(body=self.payload, content_type="application/octet-stream")
         if tail == "work_packages":
             return web.json_response({"received": await request.json()})
         if tail == "attachments/42":
+            if self.deleted:
+                return web.json_response({"message": "Attachment not found"}, status=404)
+            if request.method == "DELETE":
+                self.deleted = True
+                return web.Response(status=204)
             return web.json_response(self.metadata)
         if tail == "work_packages/17/attachments" and request.method == "POST":
             reader = await request.multipart()
@@ -126,9 +134,10 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             self.metadata["fileName"] = self.uploads[-1]["metadata"]["fileName"]
             return web.json_response(self.metadata, status=201)
         if tail == "work_packages/17/attachments":
+            elements = [] if self.deleted else [self.metadata]
             return web.json_response({
-                "_type": "Collection", "total": 1, "count": 1,
-                "_embedded": {"elements": [self.metadata]},
+                "_type": "Collection", "total": len(elements), "count": len(elements),
+                "_embedded": {"elements": elements},
             })
         return web.json_response({"message": "Fixture endpoint not found"}, status=404)
 
@@ -184,12 +193,27 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.client.download_attachment(42), self.payload)
         self.assertEqual(self.requests[-1][2]["Accept"], "application/octet-stream")
 
+    async def test_delete_handles_empty_response_and_removes_attachment(self):
+        self.assertTrue(await self.client.delete_attachment(42))
+        method, path, headers = self.requests[-1]
+        self.assertEqual((method, path), ("DELETE", "/openproject/api/v3/attachments/42"))
+        self.assertTrue(headers["Authorization"].startswith("Basic "))
+        listed = await self.client.list_work_package_attachments(17)
+        self.assertEqual(listed["_embedded"]["elements"], [])
+        for action in (self.client.get_attachment, self.client.download_attachment,
+                       self.client.delete_attachment):
+            with self.subTest(action=action.__name__):
+                with self.assertRaises(OpenProjectAPIError) as raised:
+                    await action(42)
+                self.assertEqual(raised.exception.status, 404)
+
     async def test_api_errors_keep_status_identifier_and_message(self):
         for status in (403, 404, 413):
             with self.subTest(status=status):
                 for action in (
                     self.client.get_attachment(status),
                     self.client.download_attachment(status),
+                    self.client.delete_attachment(status),
                     self.client.upload_work_package_attachment(status, "test.md", b"test"),
                 ):
                     with self.assertRaises(OpenProjectAPIError) as raised:
@@ -226,9 +250,11 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.client.upload_work_package_attachment(17, "ok.md", b"123")
         for method in (self.client.get_attachment, self.client.download_attachment,
-                       self.client.list_work_package_attachments):
-            with self.assertRaises(ValueError):
-                await method(0)
+                       self.client.list_work_package_attachments,
+                       self.client.delete_attachment):
+            for invalid_id in (0, -1):
+                with self.assertRaises(ValueError):
+                    await method(invalid_id)
         self.assertEqual(self.requests, [])
 
     async def test_mcp_registration_schema_and_full_upload_download(self):
@@ -236,10 +262,16 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             async with Client(mcp) as client:
                 registered = {tool.name: tool for tool in await client.list_tools()}
                 names = {"list_work_package_attachments", "upload_work_package_attachment",
-                         "get_attachment", "download_attachment"}
+                         "get_attachment", "download_attachment", "delete_attachment"}
                 self.assertTrue(names.issubset(registered))
                 self.assertTrue(registered["get_attachment"].annotations.readOnlyHint)
                 self.assertFalse(registered["upload_work_package_attachment"].annotations.idempotentHint)
+                deletion = registered["delete_attachment"]
+                self.assertFalse(deletion.annotations.readOnlyHint)
+                self.assertTrue(deletion.annotations.destructiveHint)
+                self.assertTrue(deletion.annotations.idempotentHint)
+                self.assertEqual(deletion.inputSchema["required"], ["attachment_id"])
+                self.assertEqual(deletion.inputSchema["properties"]["attachment_id"]["exclusiveMinimum"], 0)
                 payload = "# Handoff\r\n交接\n".encode("utf-8")
                 upload = await client.call_tool("upload_work_package_attachment", {"input": {
                     "work_package_id": 17, "file_name": "handoff.md",
@@ -259,6 +291,25 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(listed.data["total"], 1)
                 metadata = await client.call_tool("get_attachment", {"attachment_id": 42})
                 self.assertEqual(metadata.data["_links"]["container"], self.metadata["_links"]["container"])
+                deleted = await client.call_tool("delete_attachment", {"attachment_id": 42})
+                self.assertEqual(deleted.data, {"attachment_id": 42, "deleted": True})
+                listed = await client.call_tool("list_work_package_attachments", {"work_package_id": 17})
+                self.assertEqual(listed.data["total"], 0)
+                with self.assertRaisesRegex(ToolError, "Failed to delete attachment: API Error 404"):
+                    await client.call_tool("delete_attachment", {"attachment_id": 42})
+
+    async def test_mcp_delete_reports_api_errors_and_rejects_invalid_ids(self):
+        with patch.object(attachments, "get_client", return_value=self.client):
+            async with Client(mcp) as client:
+                for status in (403, 404):
+                    with self.subTest(status=status):
+                        with self.assertRaisesRegex(ToolError, f"Failed to delete attachment: API Error {status}"):
+                            await client.call_tool("delete_attachment", {"attachment_id": status})
+                count = len(self.requests)
+                for invalid_id in (0, -1):
+                    with self.subTest(attachment_id=invalid_id), self.assertRaises(ToolError):
+                        await client.call_tool("delete_attachment", {"attachment_id": invalid_id})
+                self.assertEqual(len(self.requests), count)
 
     async def test_mcp_reports_api_failure_and_invalid_id_as_errors(self):
         with patch.object(attachments, "get_client", return_value=self.client):
