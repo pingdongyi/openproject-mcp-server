@@ -431,12 +431,20 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                             "work_package_id": 17, "file_ref": reference,
                         }})
                         downloaded = await client.call_tool("download_attachment", {"attachment_id": 42})
-            for token, status in ((None, 401), ("bob-key", 404), ("alice-key", 200)):
+            # Possessing the capability link is sufficient, regardless of login.
+            for token in (None, "bob-key", "alice-key", "invalid-key"):
                 headers = {"Authorization": f"Bearer {token}"} if token else {}
                 response = await self.http.get(downloaded.data["download_path"], headers=headers)
-                self.assertEqual(response.status_code, status)
-                if status == 200:
-                    self.assertEqual(response.content, self.payload)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, self.payload)
+                self.assertEqual(response.headers["cache-control"], "no-store")
+                self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+            path = downloaded.data["download_path"]
+            altered = path[:-1] + ("a" if path[-1] != "a" else "b")
+            self.assertEqual((await self.http.get(altered)).status_code, 404)
+            self.assertEqual((await self.http.get("/attachments/downloads/unknown")).status_code, 404)
+            attachment_transfer.store.entries[downloaded.data["file_ref"]].expires_at = time.time() - 1
+            self.assertEqual((await self.http.get(path)).status_code, 404)
 
     async def test_real_authenticated_http_mcp_transfer(self):
         with patch.object(mcp, "auth", APIKeyAuthProvider({"alice-key": "alice"})), \
@@ -467,7 +475,15 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                             "work_package_id": 17, "file_ref": staged.json()["file_ref"],
                         }})
                         downloaded = await client.call_tool("download_attachment", {"attachment_id": 42})
-                    response = await http.get(downloaded.data["download_path"])
+                    # A separate browser has no MCP token or session cookies.
+                    self.assertEqual(downloaded.data["download_url"], base_url + downloaded.data["download_path"])
+                    async with httpx.AsyncClient() as browser:
+                        unauthorized = await browser.post(base_url + "/mcp", json={
+                            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": "download_attachment", "arguments": {"attachment_id": 42}},
+                        })
+                        self.assertEqual(unauthorized.status_code, 401)
+                        response = await browser.get(downloaded.data["download_url"])
                     self.assertEqual(response.status_code, 200, response.text)
                     self.assertEqual(response.content, self.payload)
                     self.assertEqual(downloaded.data["sha256"], uploaded.data["uploaded_sha256"])
@@ -475,6 +491,37 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                 server.should_exit = True
                 await asyncio.wait_for(task, 5)
                 listener.close()
+
+    async def test_public_download_url_keeps_proxy_prefix(self):
+        with patch.dict(os.environ, {"MCP_PUBLIC_URL": "https://mcp.example.com/service/"}), \
+             patch.object(attachments, "get_client", return_value=self.client):
+            async with Client(mcp) as client:
+                downloaded = await client.call_tool("download_attachment", {"attachment_id": 42})
+        self.assertEqual(downloaded.data["download_url"],
+                         "https://mcp.example.com/service" + downloaded.data["download_path"])
+
+
+class DownloadLinkTests(unittest.TestCase):
+    def test_invalid_public_base_url_rejected(self):
+        for url in ("file:///tmp", "https://user:secret@example.com", "https://example.com/?token=secret",
+                    "https://example.com/#fragment", "example.com"):
+            with self.subTest(url=url), patch.dict(os.environ, {"MCP_PUBLIC_URL": url}):
+                with self.assertRaises(ValueError):
+                    attachment_transfer.download_url("/attachments/downloads/ref")
+
+    def test_no_http_context_keeps_path_only(self):
+        with patch.dict(os.environ, {"MCP_PUBLIC_URL": ""}), \
+             patch.object(attachment_transfer, "get_http_request", side_effect=RuntimeError):
+            self.assertIsNone(attachment_transfer.download_url("/attachments/downloads/ref"))
+
+    def test_access_log_omits_download_credentials(self):
+        log_filter = attachment_transfer.DownloadAccessLogFilter()
+        record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0,
+                                   '%s - "%s %s HTTP/1.1" %s',
+                                   ("127.0.0.1", "GET", "/service/attachments/downloads/secret", 200), None)
+        self.assertFalse(log_filter.filter(record))
+        record.args = ("127.0.0.1", "POST", "/mcp", 200)
+        self.assertTrue(log_filter.filter(record))
 
 
 class AttachmentInputTests(unittest.TestCase):

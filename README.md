@@ -915,14 +915,17 @@ Get detailed information about a specific work package relation.
 | `list_work_package_attachments` | List attachment IDs, metadata and download links for a ticket. |
 | `upload_work_package_attachment` | Attach a file staged through the binary HTTP endpoint. |
 | `get_attachment` | Read an attachment's metadata and container. |
-| `download_attachment` | Prepare a temporary binary HTTP download; return its reference, path, size and SHA-256. |
+| `download_attachment` | Prepare a temporary download URL; return its reference, size and SHA-256. |
 | `delete_attachment` | Permanently delete an attachment by ID. |
 
 File bytes travel over separate HTTP endpoints, never in MCP tool arguments or
-results. Both endpoints are registered on the same HTTP/SSE server as MCP. Use
-the same bearer token for HTTP transfers and MCP calls when authentication is
-enabled. References are bound to that token and expire after **15 minutes**.
-Without MCP authentication, references act as bearer capabilities.
+results. Both endpoints are registered on the same HTTP/SSE server as MCP.
+When authentication is enabled, staging uploads and calling MCP tools require
+the MCP bearer token; staged upload references are bound to that token.
+Download URLs carry their own 256-bit random credential and do **not** require a
+Bearer header, MCP session or cookies. Both kinds of reference expire after
+**15 minutes**. Anyone possessing a download URL can fetch that file until expiry.
+Without MCP authentication, upload references also act as bearer capabilities.
 
 Upload a file in two steps:
 
@@ -959,17 +962,30 @@ Upload a file in two steps:
    attachment. List attachments before retrying an uncertain upload.
 
 To download, call `download_attachment` with `{"attachment_id": 42}`. It fetches
-the stored bytes and returns `file_ref`, `download_path`, `expires_in_seconds`,
-`file_name`, `content_type`, `size_bytes` and `sha256`. Resolve `download_path`
-against the MCP server's HTTP base URL, including any reverse proxy prefix
-(e.g. `/service` + `/attachments/downloads/...`), then GET it with the same token:
+the stored bytes and returns `download_url`, `file_ref`, `download_path`,
+`expires_in_seconds`, `file_name`, `content_type`, `size_bytes` and `sha256`.
+Open `download_url` directly in a browser, or download without an Authorization
+header:
 
 ```bash
 curl --fail-with-body \
-  'https://mcp.example.com/attachments/downloads/<file_ref>' \
-  -H "Authorization: Bearer $MCP_TOKEN" \
+  'https://mcp.example.com/attachments/downloads/<random-download-credential>' \
   -o handoff.pdf
 ```
+
+Set `MCP_PUBLIC_URL=https://mcp.example.com/service` when deployed behind a reverse
+proxy. Include the public prefix, but omit `/mcp` or `/sse`. The returned link then
+starts with `https://mcp.example.com/service/attachments/downloads/...`. Docker
+Compose forwards this setting from `.env`. Without this setting the server uses
+the current HTTP request's base URL; without either (e.g. in-process/stdio calls),
+only `download_path` is returned.
+
+Treat the whole URL as a temporary password. The server suppresses Uvicorn access
+log entries for the download endpoint, sends `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`, and does not put the MCP token in the URL.
+Configure reverse proxies and other request tracing systems to omit or redact
+these download URLs as well. Links remain reusable until expiry, so browsers can
+retry downloads. Expired, altered, unknown and upload-only references return 404.
 
 Downloads use `Content-Disposition: attachment` and preserve the original bytes.
 Compare `sha256` with `uploaded_sha256` or the original file to verify integrity.

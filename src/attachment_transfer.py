@@ -1,13 +1,16 @@
 """Temporary binary HTTP transfers, kept outside MCP messages."""
 
 import hashlib
+import logging
+import os
 import secrets
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_request
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
@@ -16,6 +19,29 @@ from src.client import MAX_ATTACHMENT_BYTES, validate_attachment_filename
 
 TRANSFER_TTL_SECONDS = 900
 MAX_TRANSFERS = 100
+
+
+class DownloadAccessLogFilter(logging.Filter):
+    """Keep capability URLs out of the server's HTTP access log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/attachments/downloads/" not in record.getMessage()
+
+
+def download_url(path: str) -> str | None:
+    """Use an explicit public base URL for proxies, otherwise the HTTP request."""
+    base_url = os.getenv("MCP_PUBLIC_URL", "").strip().rstrip("/")
+    if base_url:
+        parsed = urlsplit(base_url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.netloc
+                or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError("MCP_PUBLIC_URL must be an HTTP(S) base URL without credentials, query or fragment")
+    else:
+        try:
+            base_url = str(get_http_request().base_url).rstrip("/")
+        except RuntimeError:
+            return None
+    return base_url + path
 
 
 @dataclass
@@ -127,6 +153,8 @@ async def request_owner(request: Request) -> str | None:
 
 
 def register_transfer_routes(mcp):
+    logging.getLogger("uvicorn.access").addFilter(DownloadAccessLogFilter())
+
     @mcp.custom_route("/attachments/uploads", methods=["POST"])
     async def upload_file(request: Request):
         owner = await request_owner(request)
@@ -163,9 +191,14 @@ def register_transfer_routes(mcp):
 
     @mcp.custom_route("/attachments/downloads/{file_ref}", methods=["GET"])
     async def download_file(request: Request):
-        owner = await request_owner(request)
-        transfer = store.get(request.path_params["file_ref"], owner, "download")
+        # The 256-bit random reference is the short-lived download credential.
+        # Only authenticated MCP calls can mint references when MCP auth is on.
+        transfer = store.get(request.path_params["file_ref"], None, "download")
         return FileResponse(
             transfer.path, filename=transfer.file_name, media_type=transfer.content_type,
-            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+            },
         )

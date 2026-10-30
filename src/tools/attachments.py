@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from src.client import validate_attachment_filename
 from src.server import get_client, mcp
 from src.attachment_transfer import (
-    TRANSFER_TTL_SECONDS, register_transfer_routes, store, tool_owner,
+    TRANSFER_TTL_SECONDS, download_url, register_transfer_routes, store, tool_owner,
     validate_content_type,
 )
 
@@ -95,11 +95,13 @@ async def get_attachment(attachment_id: PositiveId) -> Dict[str, Any]:
 
 @mcp.tool(annotations={"readOnlyHint": True})
 async def download_attachment(attachment_id: PositiveId) -> Dict[str, Any]:
-    """Prepare a binary HTTP download and return its path, size and SHA-256.
+    """Prepare a binary HTTP download and return its URL, size and SHA-256.
 
-    GET download_path relative to this MCP server's HTTP base URL with the same
-    bearer token within 15 minutes. No file contents are returned through MCP.
-    Limited to 10 MiB. Temporary downloads are process-local.
+    Open download_url directly within 15 minutes; no Bearer token is needed.
+    The URL itself grants download access: share only with intended recipients.
+    No file contents are returned through MCP. Limited to 10 MiB. Temporary
+    downloads are process-local. MCP_PUBLIC_URL overrides the HTTP request base
+    URL for proxies; without either, only download_path is available.
     """
     reference = None
     try:
@@ -108,20 +110,25 @@ async def download_attachment(attachment_id: PositiveId) -> Dict[str, Any]:
         file_name = validate_attachment_filename(metadata.get("fileName") or f"attachment-{attachment_id}")
         content_type = validate_content_type(metadata.get("contentType") or "application/octet-stream")
         payload = await client.download_attachment(attachment_id)
-        reference, transfer = store.create(file_name, content_type, tool_owner(), "download")
+        reference, transfer = store.create(file_name, content_type, None, "download")
         transfer.path.write_bytes(payload)
         transfer.size_bytes = len(payload)
         transfer.sha256 = hashlib.sha256(payload).hexdigest()
-        return {
+        path = f"/attachments/downloads/{reference}"
+        result = {
             "attachment_id": attachment_id,
             "file_name": file_name,
             "content_type": content_type,
             "size_bytes": transfer.size_bytes,
             "sha256": transfer.sha256,
             "file_ref": reference,
-            "download_path": f"/attachments/downloads/{reference}",
+            "download_path": path,
             "expires_in_seconds": TRANSFER_TTL_SECONDS,
         }
+        url = download_url(path)
+        if url:
+            result["download_url"] = url
+        return result
     except Exception as error:
         if reference is not None:
             store.discard(reference)
