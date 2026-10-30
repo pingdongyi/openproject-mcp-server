@@ -7,6 +7,7 @@ import secrets
 import tempfile
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -16,9 +17,33 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 
 from src.client import MAX_ATTACHMENT_BYTES, validate_attachment_filename
+from src.attachment_errors import attachment_error
 
 TRANSFER_TTL_SECONDS = 900
 MAX_TRANSFERS = 100
+
+
+def attachment_http_errors(operation):
+    """Return JSON errors while preserving HTTP status and authentication headers."""
+    def decorate(handler):
+        @wraps(handler)
+        async def wrapped(request):
+            try:
+                return await handler(request)
+            except Exception as error:
+                details = attachment_error(error, operation)
+                status = error.status_code if isinstance(error, HTTPException) else (
+                    400 if isinstance(error, ValueError) else 500
+                )
+                details["http_status"] = status
+                headers = {"Cache-Control": "no-store"}
+                if isinstance(error, HTTPException) and error.headers:
+                    headers.update(error.headers)
+                if status >= 500 and not isinstance(error, HTTPException):
+                    logging.getLogger(__name__).exception("Attachment %s failed", operation)
+                return JSONResponse({"error": details}, status_code=status, headers=headers)
+        return wrapped
+    return decorate
 
 
 class DownloadAccessLogFilter(logging.Filter):
@@ -156,8 +181,19 @@ def register_transfer_routes(mcp):
     logging.getLogger("uvicorn.access").addFilter(DownloadAccessLogFilter())
 
     @mcp.custom_route("/attachments/uploads", methods=["POST"])
+    @attachment_http_errors("stage")
     async def upload_file(request: Request):
         owner = await request_owner(request)
+        declared_size = request.headers.get("content-length")
+        if declared_size is not None:
+            try:
+                declared_size = int(declared_size)
+            except ValueError as error:
+                raise HTTPException(400, "Content-Length must be a non-negative integer") from error
+            if declared_size < 0:
+                raise HTTPException(400, "Content-Length must be a non-negative integer")
+            if declared_size > MAX_ATTACHMENT_BYTES:
+                raise HTTPException(413, "Attachment exceeds the 10 MiB limit")
         try:
             file_name = validate_attachment_filename(
                 request.query_params.get("file_name", "")
@@ -190,6 +226,7 @@ def register_transfer_routes(mcp):
         }, status_code=201, headers={"Cache-Control": "no-store"})
 
     @mcp.custom_route("/attachments/downloads/{file_ref}", methods=["GET"])
+    @attachment_http_errors("fetch")
     async def download_file(request: Request):
         # The 256-bit random reference is the short-lived download credential.
         # Only authenticated MCP calls can mint references when MCP auth is on.

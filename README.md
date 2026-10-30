@@ -942,8 +942,12 @@ Get detailed information about a specific work package relation.
 
 File bytes travel over separate HTTP endpoints, never in MCP tool arguments or
 results. Both endpoints are registered on the same HTTP/SSE server as MCP.
+Obtain the MCP service's public base URL from the client connection metadata or
+configuration; retain any reverse proxy prefix and omit the `/mcp` or `/sse`
+endpoint suffix. Do not substitute the OpenProject API URL or guess an address.
 When authentication is enabled, staging uploads and calling MCP tools require
-the MCP bearer token; staged upload references are bound to that token.
+the same MCP bearer token (not the OpenProject API key); staged upload references
+are bound to that token. Do not include tokens in logs or shared examples.
 Download URLs carry their own 256-bit random credential and do **not** require a
 Bearer header, MCP session or cookies. Both kinds of reference expire after
 **15 minutes**. Anyone possessing a download URL can fetch that file until expiry.
@@ -952,6 +956,7 @@ Without MCP authentication, upload references also act as bearer capabilities.
 Upload a file in two steps:
 
 1. POST the raw binary file to `/attachments/uploads?file_name=<URL-encoded-basename>`.
+   The body is the file's original bytes, not multipart, JSON or Base64.
    Set `Content-Type` to the file's MIME type (default `application/octet-stream`).
    For example, with the server at `https://mcp.example.com`:
 
@@ -963,8 +968,9 @@ Upload a file in two steps:
      --data-binary @handoff.pdf
    ```
 
-   The JSON response contains `file_ref`, `file_name`, `size_bytes`, `sha256`
+   The HTTP 201 JSON response contains `file_ref`, `file_name`, `size_bytes`, `sha256`
    and `expires_in_seconds`. This stage does not create an OpenProject attachment.
+   Check the returned size and SHA-256 against the local file before attaching it.
 
 2. Pass the returned reference to `upload_work_package_attachment`:
 
@@ -980,6 +986,9 @@ Upload a file in two steps:
 
    Optional `file_name` and `content_type` override the staged metadata.
    The response contains `attachment`, `uploaded_size_bytes` and `uploaded_sha256`.
+   `attachment` contains compact metadata as described below. The uploaded size
+   and SHA-256 describe the bytes sent upstream, not an independent read-back
+   of the final OpenProject attachment.
    The reference can be reused until expiry, but each tool call creates a new
    attachment. List attachments before retrying an uncertain upload.
 
@@ -995,12 +1004,21 @@ curl --fail-with-body \
   -o handoff.pdf
 ```
 
+Tool success only prepares a server-side transfer. A client must GET the URL,
+write the bytes to the requested local directory, and verify the written byte
+count equals `size_bytes` and SHA-256 equals `sha256` before reporting a completed
+download. Report HTTP transfer or verification failures separately from preparing
+the link. Prepare a new link if the reference expires.
+
 Set `MCP_PUBLIC_URL=https://mcp.example.com/service` when deployed behind a reverse
 proxy. Include the public prefix, but omit `/mcp` or `/sse`. The returned link then
 starts with `https://mcp.example.com/service/attachments/downloads/...`. Docker
 Compose forwards this setting from `.env`. Without this setting the server uses
 the current HTTP request's base URL; without either (e.g. in-process/stdio calls),
 only `download_path` is returned.
+Resolve that path against the known public transfer base, including its proxy
+prefix, rather than appending it to `/mcp`. If no public base is available,
+report the missing server URL instead of guessing.
 
 Treat the whole URL as a temporary password. The server suppresses Uvicorn access
 log entries for the download endpoint, sends `Cache-Control: no-store` and
@@ -1015,7 +1033,22 @@ Compare `sha256` with `uploaded_sha256` or the original file to verify integrity
 Files are limited to **10 MiB**; OpenProject may enforce a lower upload limit.
 HTTP endpoints reject invalid metadata (400), invalid authentication (401),
 inaccessible/expired references (404), oversized files (413), and full temporary
-storage (503). MCP failures are reported as tool errors. The server keeps at most
+storage (503). Attachment HTTP errors return `{"error": {...}}` with `code`,
+`message`, `retryable` and `http_status`, while preserving the HTTP status and
+authentication challenge headers. Attachment execution failures remain MCP tool
+errors (`isError=true`); their text body is a JSON object with `code`, `message`,
+`retryable`, and, when applicable, `http_status`, `error_identifier` and `next_step`.
+Framework input-schema validation retains FastMCP's standard validation errors.
+
+Timeouts, connection failures and upstream 5xx responses after an upload starts
+set `outcome_unknown=true` and `retryable=false`: the attachment may already exist.
+List target attachments before deciding whether to retry; repeated uploads can
+create duplicates. Expired/inaccessible references use `file_reference_unavailable`
+and require staging/preparing again. TLS errors use `tls_error`; inspect certificate
+trust, proxy settings and the nested exception rather than automatically disabling
+verification or assuming a sandbox restriction.
+
+The server keeps at most
 100 temporary transfers (including in-progress uploads) in its private system
 temporary directory. Expired files are purged on the next transfer operation;
 normal process shutdown cleans up the temporary directory. References are
@@ -1029,12 +1062,22 @@ need an HTTP deployment for these file transfers. Restart the server and reconne
 the MCP client to refresh the tool schemas.
 
 To delete an attachment, call `delete_attachment` with `{"attachment_id": 42}`.
-Find the ID with `list_work_package_attachments` or inspect it with `get_attachment`
-first. Deletion is permanent and requires permission to delete attachments in the
+Reuse an ID already identified by list/get/upload results; query first only when
+the target is unclear or needs refreshing. Deletion is permanent and requires permission to delete attachments in the
 attachment's container. Success returns `{"attachment_id": 42, "deleted": true}`;
 permission failures and missing attachments are MCP tool errors. Deleting the same
-ID again reports a 404 error. The tool is annotated destructive and idempotent
+ID again reports an `attachment_not_found` error with `http_status=404`, not a
+new successful deletion. A 404 can also mean the attachment is inaccessible.
+After an uncertain deletion, query the attachment or list its container before
+retrying. The tool is annotated destructive and idempotent
 because repeating it has no additional effect on server state.
+
+List/get/upload responses retain attachment field names (`id`, `fileName`,
+`fileSize`, `contentType`, `status`, `createdAt`, `digest`) when available, plain
+description fields (`format`, `raw`), and self/container/download links. They omit
+embedded tasks, author profiles, unrelated links and rendered description HTML.
+Lists retain the HAL `_embedded.elements` structure, counts and pagination data.
+Reuse returned IDs directly; there is no mandatory extra list/get before each action.
 
 The tools are discovered automatically by all FastMCP entry points. Restart or
 redeploy the running MCP server, then reconnect the MCP client to refresh its

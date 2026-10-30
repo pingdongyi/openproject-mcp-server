@@ -7,13 +7,14 @@ import hashlib
 import json
 import logging
 import os
+import ssl
 from pathlib import Path
 import unittest
 import time
 
 import httpx
 import uvicorn
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import web
 from fastmcp import Client
@@ -22,6 +23,7 @@ from pydantic import ValidationError
 from starlette.exceptions import HTTPException
 
 from src.client import OpenProjectAPIError, OpenProjectClient
+from src.attachment_errors import attachment_error
 
 # Import and register tools with dummy configuration, without loading a real .env.
 with patch.dict(os.environ, {
@@ -321,7 +323,7 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(deleted.data, {"attachment_id": 42, "deleted": True})
                 listed = await client.call_tool("list_work_package_attachments", {"work_package_id": 17})
                 self.assertEqual(listed.data["total"], 0)
-                with self.assertRaisesRegex(ToolError, "Failed to delete attachment: API Error 404"):
+                with self.assertRaisesRegex(ToolError, "API Error 404"):
                     await client.call_tool("delete_attachment", {"attachment_id": 42})
 
     async def test_mcp_delete_reports_api_errors_and_rejects_invalid_ids(self):
@@ -329,8 +331,16 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             async with Client(mcp) as client:
                 for status in (403, 404):
                     with self.subTest(status=status):
-                        with self.assertRaisesRegex(ToolError, f"Failed to delete attachment: API Error {status}"):
-                            await client.call_tool("delete_attachment", {"attachment_id": status})
+                        result = await client.call_tool(
+                            "delete_attachment", {"attachment_id": status}, raise_on_error=False,
+                        )
+                        self.assertTrue(result.is_error)
+                        error = json.loads(result.content[0].text)
+                        self.assertEqual(error["http_status"], status)
+                        self.assertEqual(error["error_identifier"], "attachment-test-error")
+                        self.assertEqual(error["code"],
+                                         "permission_denied" if status == 403 else "attachment_not_found")
+                        self.assertFalse(error["retryable"])
                 count = len(self.requests)
                 for invalid_id in (0, -1):
                     with self.subTest(attachment_id=invalid_id), self.assertRaises(ToolError):
@@ -364,6 +374,100 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                     hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 )
 
+    async def test_mcp_metadata_omits_embedded_tasks_users_and_html(self):
+        self.metadata.update({
+            "_embedded": {"author": {"email": "private@example.test"},
+                          "container": {"description": "unrelated task body"}},
+            "description": {"format": "plain", "raw": "attachment note", "html": "<p>note</p>"},
+            "digest": {"algorithm": "md5", "hash": hashlib.md5(self.payload).hexdigest()},
+        })
+        self.metadata["_links"]["author"] = {"href": "/users/1", "title": "Private user"}
+        with patch.object(attachments, "get_client", return_value=self.client):
+            async with Client(mcp) as client:
+                metadata = await client.call_tool("get_attachment", {"attachment_id": 42})
+                listed = await client.call_tool("list_work_package_attachments", {"work_package_id": 17})
+                uploaded = await client.call_tool("upload_work_package_attachment", {"input": {
+                    "work_package_id": 17, "file_ref": await self.stage(self.payload),
+                }})
+        for item in (metadata.data, listed.data["_embedded"]["elements"][0],
+                     uploaded.data["attachment"]):
+            self.assertEqual(item["id"], 42)
+            self.assertEqual(item["fileSize"], len(self.payload))
+            self.assertEqual(item["digest"], self.metadata["digest"])
+            self.assertEqual(item["description"], {"format": "plain", "raw": "attachment note"})
+            self.assertEqual(item["_links"]["container"], self.metadata["_links"]["container"])
+            self.assertNotIn("_embedded", item)
+            self.assertNotIn("author", item["_links"])
+            self.assertNotIn("private@example.test", json.dumps(item))
+        # Projection must not mutate the API client response.
+        self.assertIn("html", self.metadata["description"])
+        self.assertIn("_embedded", self.metadata)
+
+    async def test_uncertain_upload_failures_require_listing_before_retry(self):
+        reference = await self.stage(self.payload)
+        failures = (
+            TimeoutError("request timed out"),
+            OpenProjectAPIError(503, '{"message":"Service unavailable"}', "API Error 503"),
+            ConnectionError("connection dropped"),
+        )
+        with patch.object(attachments, "get_client", return_value=self.client):
+            async with Client(mcp) as client:
+                for failure in failures:
+                    with self.subTest(failure=type(failure).__name__), patch.object(
+                        self.client, "upload_work_package_attachment", AsyncMock(side_effect=failure),
+                    ) as upload:
+                        result = await client.call_tool("upload_work_package_attachment", {"input": {
+                            "work_package_id": 17, "file_ref": reference,
+                        }}, raise_on_error=False)
+                        self.assertTrue(result.is_error)
+                        error = json.loads(result.content[0].text)
+                        self.assertTrue(error["outcome_unknown"])
+                        self.assertFalse(error["retryable"])
+                        self.assertIn("List", error["next_step"])
+                        upload.assert_awaited_once()
+
+    async def test_rejected_upload_and_missing_reference_are_distinct_errors(self):
+        with patch.object(attachments, "get_client", return_value=self.client):
+            async with Client(mcp) as client:
+                for work_package_id, reference, code in (
+                    (403, await self.stage(self.payload), "permission_denied"),
+                    (17, "missing-reference", "file_reference_unavailable"),
+                ):
+                    result = await client.call_tool("upload_work_package_attachment", {"input": {
+                        "work_package_id": work_package_id, "file_ref": reference,
+                    }}, raise_on_error=False)
+                    self.assertTrue(result.is_error)
+                    error = json.loads(result.content[0].text)
+                    self.assertEqual(error["code"], code)
+                    self.assertFalse(error["retryable"])
+                    self.assertNotIn("outcome_unknown", error)
+
+    async def test_download_rejects_oversized_metadata_before_fetching_content(self):
+        self.metadata["fileSize"] = attachments.MAX_ATTACHMENT_BYTES + 1
+        with patch.object(attachments, "get_client", return_value=self.client):
+            async with Client(mcp) as client:
+                result = await client.call_tool("download_attachment", {"attachment_id": 42},
+                                                raise_on_error=False)
+        self.assertTrue(result.is_error)
+        self.assertEqual(json.loads(result.content[0].text)["code"], "attachment_too_large")
+        self.assertEqual([item[1] for item in self.requests], ["/openproject/api/v3/attachments/42"])
+        self.assertEqual(attachment_transfer.store.entries, {})
+
+    async def test_http_declared_size_rejected_before_allocating_storage(self):
+        with patch.object(attachment_transfer, "MAX_ATTACHMENT_BYTES", 2), \
+             patch.object(attachment_transfer.store, "create") as create:
+            response = await self.http.post("/attachments/uploads?file_name=ok", content=b"123")
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"]["code"], "attachment_too_large")
+        create.assert_not_called()
+
+    async def test_http_storage_error_omits_internal_paths(self):
+        with patch.object(attachment_transfer.store, "create", side_effect=PermissionError("/private/path")):
+            response = await self.http.post("/attachments/uploads?file_name=ok", content=b"a")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "storage_error")
+        self.assertNotIn("/private/path", response.text)
+
     async def test_http_upload_limits_empty_and_invalid_metadata(self):
         for params, content, headers, expected in (
             ({"file_name": "../bad"}, b"a", {}, 400),
@@ -374,12 +478,16 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             response = await self.http.post("/attachments/uploads", params=params,
                                             content=content, headers=headers)
             self.assertEqual(response.status_code, expected)
+            self.assertEqual(response.json()["error"]["code"], "invalid_input")
+            self.assertFalse(response.json()["error"]["retryable"])
+            self.assertEqual(response.headers["cache-control"], "no-store")
         with patch.object(attachment_transfer, "MAX_ATTACHMENT_BYTES", 2):
             async def chunks():
                 yield b"12"
                 yield b"3"
             response = await self.http.post("/attachments/uploads?file_name=ok", content=chunks())
             self.assertEqual(response.status_code, 413)
+            self.assertEqual(response.json()["error"]["code"], "attachment_too_large")
         self.assertEqual(attachment_transfer.store.entries, {})
         self.assertEqual(list(Path(attachment_transfer.store.directory.name).iterdir()), [])
 
@@ -408,6 +516,8 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(attachment_transfer, "MAX_TRANSFERS", 1):
             response = await self.http.post("/attachments/uploads?file_name=ok", content=b"a")
             self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()["error"]["code"], "transfer_capacity_reached")
+            self.assertTrue(response.json()["error"]["retryable"])
 
     async def test_authentication_and_owner_isolation(self):
         auth = APIKeyAuthProvider({"alice-key": "alice", "bob-key": "bob"})
@@ -415,6 +525,8 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             for headers in ({}, {"Authorization": "Bearer wrong"}):
                 response = await self.http.post("/attachments/uploads?file_name=ok", content=b"a", headers=headers)
                 self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.headers["www-authenticate"], "Bearer")
+                self.assertEqual(response.json()["error"]["code"], "authentication_failed")
             response = await self.http.post("/attachments/uploads?file_name=ok", content=self.payload,
                                             headers={"Authorization": "Bearer alice-key"})
             self.assertEqual(response.status_code, 201)
@@ -443,6 +555,8 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
             altered = path[:-1] + ("a" if path[-1] != "a" else "b")
             self.assertEqual((await self.http.get(altered)).status_code, 404)
             self.assertEqual((await self.http.get("/attachments/downloads/unknown")).status_code, 404)
+            missing = await self.http.get("/attachments/downloads/unknown")
+            self.assertEqual(missing.json()["error"]["code"], "file_reference_unavailable")
             attachment_transfer.store.entries[downloaded.data["file_ref"]].expires_at = time.time() - 1
             self.assertEqual((await self.http.get(path)).status_code, 404)
 
@@ -499,6 +613,30 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                 downloaded = await client.call_tool("download_attachment", {"attachment_id": 42})
         self.assertEqual(downloaded.data["download_url"],
                          "https://mcp.example.com/service" + downloaded.data["download_path"])
+
+
+class AttachmentErrorTests(unittest.TestCase):
+    def test_nested_network_and_tls_errors_do_not_leak_credentials(self):
+        for cause, code in (
+            (ConnectionError("Bearer secret-token"), "network_error"),
+            (ssl.SSLError("https://user:password@proxy.test"), "tls_error"),
+            (TimeoutError("timed out"), "timeout"),
+        ):
+            wrapped = Exception("Network error at private URL")
+            wrapped.__cause__ = cause
+            result = attachment_error(wrapped, "download")
+            self.assertEqual(result["code"], code)
+            self.assertNotIn("secret-token", json.dumps(result))
+            self.assertNotIn("password", json.dumps(result))
+            self.assertNotIn("private URL", json.dumps(result))
+            self.assertEqual(result["retryable"], code != "tls_error")
+
+    def test_transient_read_errors_are_retryable(self):
+        for status in (408, 429, 503):
+            error = OpenProjectAPIError(status, "", f"API Error {status}")
+            self.assertTrue(attachment_error(error, "get")["retryable"])
+        result = attachment_error(TimeoutError(), "delete")
+        self.assertIn("before retrying", result["next_step"])
 
 
 class DownloadLinkTests(unittest.TestCase):
