@@ -913,39 +913,82 @@ Get detailed information about a specific work package relation.
 | Tool | Purpose |
 | --- | --- |
 | `list_work_package_attachments` | List attachment IDs, metadata and download links for a ticket. |
-| `upload_work_package_attachment` | Attach UTF-8 text or Base64 file contents to an existing ticket. |
+| `upload_work_package_attachment` | Attach a file staged through the binary HTTP endpoint. |
 | `get_attachment` | Read an attachment's metadata and container. |
-| `download_attachment` | Return Base64 file bytes, size and SHA-256; optionally return only size/hash. |
+| `download_attachment` | Prepare a temporary binary HTTP download; return its reference, path, size and SHA-256. |
 | `delete_attachment` | Permanently delete an attachment by ID. |
 
-Uploads take an `input` object. Supply exactly one of `content` (UTF-8 text) or
-`content_base64` (standard Base64). No path on the MCP server is required.
-Uploads and downloads are limited to **10 MiB of decoded file bytes**; OpenProject
-may enforce a lower limit. These tools return structured JSON and report failures
-as MCP tool errors. Read tools are annotated read-only; upload creates an attachment
-and is not idempotent. List attachments before retrying an uncertain upload.
+File bytes travel over separate HTTP endpoints, never in MCP tool arguments or
+results. Both endpoints are registered on the same HTTP/SSE server as MCP. Use
+the same bearer token for HTTP transfers and MCP calls when authentication is
+enabled. References are bound to that token and expire after **15 minutes**.
+Without MCP authentication, references act as bearer capabilities.
 
-Example: `upload_work_package_attachment`
+Upload a file in two steps:
 
-```json
-{
-  "input": {
-    "work_package_id": 24717,
-    "file_name": "ALSPC-24717_Treatment_Current_Exports.md",
-    "content": "# ALSPC-24717: Treatment Current exports\n\nTicket handoff.\n",
-    "content_type": "text/markdown",
-    "description": "Repository handoff document"
-  }
-}
+1. POST the raw binary file to `/attachments/uploads?file_name=<URL-encoded-basename>`.
+   Set `Content-Type` to the file's MIME type (default `application/octet-stream`).
+   For example, with the server at `https://mcp.example.com`:
+
+   ```bash
+   curl --fail-with-body -X POST \
+     'https://mcp.example.com/attachments/uploads?file_name=handoff.pdf' \
+     -H "Authorization: Bearer $MCP_TOKEN" \
+     -H 'Content-Type: application/pdf' \
+     --data-binary @handoff.pdf
+   ```
+
+   The JSON response contains `file_ref`, `file_name`, `size_bytes`, `sha256`
+   and `expires_in_seconds`. This stage does not create an OpenProject attachment.
+
+2. Pass the returned reference to `upload_work_package_attachment`:
+
+   ```json
+   {
+     "input": {
+       "work_package_id": 24717,
+       "file_ref": "<file_ref from the HTTP upload>",
+       "description": "Repository handoff document"
+     }
+   }
+   ```
+
+   Optional `file_name` and `content_type` override the staged metadata.
+   The response contains `attachment`, `uploaded_size_bytes` and `uploaded_sha256`.
+   The reference can be reused until expiry, but each tool call creates a new
+   attachment. List attachments before retrying an uncertain upload.
+
+To download, call `download_attachment` with `{"attachment_id": 42}`. It fetches
+the stored bytes and returns `file_ref`, `download_path`, `expires_in_seconds`,
+`file_name`, `content_type`, `size_bytes` and `sha256`. Resolve `download_path`
+against the MCP server's HTTP base URL, including any reverse proxy prefix
+(e.g. `/service` + `/attachments/downloads/...`), then GET it with the same token:
+
+```bash
+curl --fail-with-body \
+  'https://mcp.example.com/attachments/downloads/<file_ref>' \
+  -H "Authorization: Bearer $MCP_TOKEN" \
+  -o handoff.pdf
 ```
 
-`file_name` must be a basename, not a path. `content_type` and `description` are
-optional; MIME type is inferred from the filename. Text is encoded as UTF-8;
-use Base64 to preserve original encoding, line endings and binary file bytes.
-The upload response includes `attachment`, `uploaded_size_bytes` and
-`uploaded_sha256` (computed from the **sent** bytes). For verification, call
-`download_attachment` with the returned attachment ID and `include_content: false`;
-compare its `size_bytes` and `sha256` with the upload values or original file.
+Downloads use `Content-Disposition: attachment` and preserve the original bytes.
+Compare `sha256` with `uploaded_sha256` or the original file to verify integrity.
+
+Files are limited to **10 MiB**; OpenProject may enforce a lower upload limit.
+HTTP endpoints reject invalid metadata (400), invalid authentication (401),
+inaccessible/expired references (404), oversized files (413), and full temporary
+storage (503). MCP failures are reported as tool errors. The server keeps at most
+100 temporary transfers (including in-progress uploads) in its private system
+temporary directory. Expired files are purged on the next transfer operation;
+normal process shutdown cleans up the temporary directory. References are
+process-local and are lost on restart: use one worker, or sticky routing across
+MCP and file endpoints. Configure the reverse proxy to forward `/attachments/*`
+as well as `/mcp` (or `/sse`), with a binary request-body limit of at least 10 MiB.
+
+**Migration:** `content`, `content_base64` and `include_content` have been removed.
+Clients must stage uploads and fetch downloads through HTTP. Pure stdio clients
+need an HTTP deployment for these file transfers. Restart the server and reconnect
+the MCP client to refresh the tool schemas.
 
 To delete an attachment, call `delete_attachment` with `{"attachment_id": 42}`.
 Find the ID with `list_work_package_attachments` or inspect it with `get_attachment`

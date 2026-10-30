@@ -1,17 +1,25 @@
 """Isolated attachment tests: local HTTP only, never a live OpenProject instance."""
 
 import base64
+import asyncio
+import socket
 import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import unittest
+import time
+
+import httpx
+import uvicorn
 from unittest.mock import patch
 
 from aiohttp import web
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
+from starlette.exceptions import HTTPException
 
 from src.client import OpenProjectAPIError, OpenProjectClient
 
@@ -24,6 +32,8 @@ with patch.dict(os.environ, {
 }), patch("dotenv.load_dotenv", return_value=False):
     from src.server import mcp
     from src.tools import attachments
+    from src import attachment_transfer
+    from src.auth import APIKeyAuthProvider
 
 
 def setUpModule():
@@ -39,6 +49,11 @@ def tearDownModule():
 
 class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.http = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp.http_app()), base_url="http://mcp.test"
+        )
+        self.addAsyncCleanup(self.http.aclose)
+        self.addCleanup(self.clear_transfers)
         self.payload = b"\x00\xff\r\nAttachment bytes\n"
         self.requests = []
         self.uploads = []
@@ -70,6 +85,18 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.client = OpenProjectClient(
             f"http://127.0.0.1:{port}/openproject", "isolated-test-key"
         )
+
+    def clear_transfers(self):
+        for reference in list(attachment_transfer.store.entries):
+            attachment_transfer.store.discard(reference)
+
+    async def stage(self, payload, name="handoff.md"):
+        response = await self.http.post(
+            "/attachments/uploads", params={"file_name": name}, content=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["file_ref"]
 
     async def storage(self, request):
         self.storage_headers.append(dict(request.headers))
@@ -275,18 +302,17 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                 payload = "# Handoff\r\n交接\n".encode("utf-8")
                 upload = await client.call_tool("upload_work_package_attachment", {"input": {
                     "work_package_id": 17, "file_name": "handoff.md",
-                    "content_base64": base64.b64encode(payload).decode("ascii"),
+                    "file_ref": await self.stage(payload),
                 }})
                 sent = upload.data
                 self.assertEqual(sent["uploaded_sha256"], hashlib.sha256(payload).hexdigest())
                 downloaded = await client.call_tool("download_attachment", {"attachment_id": 42})
-                self.assertEqual(base64.b64decode(downloaded.data["content_base64"]), payload)
+                self.assertNotIn("content_base64", downloaded.data)
+                response = await self.http.get(downloaded.data["download_path"])
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, payload)
+                self.assertIn("attachment;", response.headers["content-disposition"])
                 self.assertEqual(downloaded.data["sha256"], sent["uploaded_sha256"])
-                compact = await client.call_tool("download_attachment", {
-                    "attachment_id": 42, "include_content": False,
-                })
-                self.assertNotIn("content_base64", compact.data)
-                self.assertEqual(compact.data["size_bytes"], len(payload))
                 listed = await client.call_tool("list_work_package_attachments", {"work_package_id": 17})
                 self.assertEqual(listed.data["total"], 1)
                 metadata = await client.call_tool("get_attachment", {"attachment_id": 42})
@@ -321,7 +347,7 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                     await client.call_tool("get_attachment", {"attachment_id": 0})
                 self.assertEqual(len(self.requests), count)
 
-    async def test_mcp_text_upload_returns_matching_utf8_hash(self):
+    async def test_mcp_staged_upload_returns_matching_utf8_hash(self):
         with patch.object(attachments, "get_client", return_value=self.client):
             async with Client(mcp) as client:
                 text = "# 文档\r\nHandoff\n"
@@ -329,7 +355,7 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                     "input": {
                         "work_package_id": 17,
                         "file_name": "handoff.md",
-                        "content": text,
+                        "file_ref": await self.stage(text.encode("utf-8")),
                     }
                 })
                 self.assertEqual(self.uploads[0]["bytes"], text.encode("utf-8"))
@@ -338,45 +364,140 @@ class AttachmentTransportTests(unittest.IsolatedAsyncioTestCase):
                     hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 )
 
+    async def test_http_upload_limits_empty_and_invalid_metadata(self):
+        for params, content, headers, expected in (
+            ({"file_name": "../bad"}, b"a", {}, 400),
+            ({"file_name": "ok"}, b"", {}, 400),
+            ({"file_name": "ok"}, b"a", {"Content-Type": "invalid"}, 400),
+            ({}, b"a", {}, 400),
+        ):
+            response = await self.http.post("/attachments/uploads", params=params,
+                                            content=content, headers=headers)
+            self.assertEqual(response.status_code, expected)
+        with patch.object(attachment_transfer, "MAX_ATTACHMENT_BYTES", 2):
+            async def chunks():
+                yield b"12"
+                yield b"3"
+            response = await self.http.post("/attachments/uploads?file_name=ok", content=chunks())
+            self.assertEqual(response.status_code, 413)
+        self.assertEqual(attachment_transfer.store.entries, {})
+        self.assertEqual(list(Path(attachment_transfer.store.directory.name).iterdir()), [])
+
+    async def test_expired_wrong_purpose_and_unknown_refs_rejected(self):
+        reference = await self.stage(self.payload)
+        response = await self.http.get(f"/attachments/downloads/{reference}")
+        self.assertEqual(response.status_code, 404)
+        transfer = attachment_transfer.store.entries[reference]
+        transfer.expires_at = time.time() - 1
+        # Windows may keep an expired download open; it must still be inaccessible.
+        with patch.object(Path, "unlink", side_effect=PermissionError):
+            with self.assertRaisesRegex(HTTPException, "expired or inaccessible"):
+                attachment_transfer.store.get(reference, None, "upload")
+        with patch.object(attachments, "get_client", return_value=self.client):
+            async with Client(mcp) as client:
+                for ref in (reference, "unknown", "../../secret"):
+                    with self.assertRaises(ToolError):
+                        await client.call_tool("upload_work_package_attachment", {"input": {
+                            "work_package_id": 17, "file_ref": ref,
+                        }})
+        self.assertFalse(transfer.path.exists())
+        self.assertEqual(self.requests, [])
+
+    async def test_capacity_is_bounded(self):
+        await self.stage(self.payload)
+        with patch.object(attachment_transfer, "MAX_TRANSFERS", 1):
+            response = await self.http.post("/attachments/uploads?file_name=ok", content=b"a")
+            self.assertEqual(response.status_code, 503)
+
+    async def test_authentication_and_owner_isolation(self):
+        auth = APIKeyAuthProvider({"alice-key": "alice", "bob-key": "bob"})
+        with patch.object(mcp, "auth", auth):
+            for headers in ({}, {"Authorization": "Bearer wrong"}):
+                response = await self.http.post("/attachments/uploads?file_name=ok", content=b"a", headers=headers)
+                self.assertEqual(response.status_code, 401)
+            response = await self.http.post("/attachments/uploads?file_name=ok", content=self.payload,
+                                            headers={"Authorization": "Bearer alice-key"})
+            self.assertEqual(response.status_code, 201)
+            reference = response.json()["file_ref"]
+            with patch.object(attachments, "get_client", return_value=self.client):
+                async with Client(mcp) as client:
+                    with patch.object(attachments, "tool_owner", return_value=hashlib.sha256(b"bob-key").hexdigest()):
+                        with self.assertRaises(ToolError):
+                            await client.call_tool("upload_work_package_attachment", {"input": {
+                                "work_package_id": 17, "file_ref": reference,
+                            }})
+                    with patch.object(attachments, "tool_owner", return_value=hashlib.sha256(b"alice-key").hexdigest()):
+                        await client.call_tool("upload_work_package_attachment", {"input": {
+                            "work_package_id": 17, "file_ref": reference,
+                        }})
+                        downloaded = await client.call_tool("download_attachment", {"attachment_id": 42})
+            for token, status in ((None, 401), ("bob-key", 404), ("alice-key", 200)):
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                response = await self.http.get(downloaded.data["download_path"], headers=headers)
+                self.assertEqual(response.status_code, status)
+                if status == 200:
+                    self.assertEqual(response.content, self.payload)
+
+    async def test_real_authenticated_http_mcp_transfer(self):
+        with patch.object(mcp, "auth", APIKeyAuthProvider({"alice-key": "alice"})), \
+             patch.object(attachments, "get_client", return_value=self.client):
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            server = uvicorn.Server(uvicorn.Config(
+                mcp.http_app(), log_level="critical", lifespan="on",
+            ))
+            task = asyncio.create_task(server.serve(sockets=[listener]))
+            try:
+                async def wait_started():
+                    while not server.started:
+                        if task.done():
+                            await task
+                            raise RuntimeError("HTTP server stopped before starting")
+                        await asyncio.sleep(0.01)
+                await asyncio.wait_for(wait_started(), 5)
+                base_url = f"http://127.0.0.1:{port}"
+                async with httpx.AsyncClient(base_url=base_url, headers={
+                    "Authorization": "Bearer alice-key",
+                }) as http:
+                    staged = await http.post("/attachments/uploads?file_name=blob.bin", content=self.payload)
+                    self.assertEqual(staged.status_code, 201, staged.text)
+                    async with Client(base_url + "/mcp", auth="alice-key") as client:
+                        uploaded = await client.call_tool("upload_work_package_attachment", {"input": {
+                            "work_package_id": 17, "file_ref": staged.json()["file_ref"],
+                        }})
+                        downloaded = await client.call_tool("download_attachment", {"attachment_id": 42})
+                    response = await http.get(downloaded.data["download_path"])
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.content, self.payload)
+                    self.assertEqual(downloaded.data["sha256"], uploaded.data["uploaded_sha256"])
+            finally:
+                server.should_exit = True
+                await asyncio.wait_for(task, 5)
+                listener.close()
+
 
 class AttachmentInputTests(unittest.TestCase):
     def model(self, **payload):
         return attachments.UploadWorkPackageAttachmentInput(
-            work_package_id=17, file_name="handoff.md", **payload
+            work_package_id=17, **payload
         )
 
-    def test_text_encoded_as_utf8_and_binary_decoded_exactly(self):
-        self.assertEqual(self.model(content="交接\r\n").decoded_content(), "交接\r\n".encode("utf-8"))
-        self.assertEqual(self.model(content_base64="AP8=").decoded_content(), b"\x00\xff")
-
-    def test_exactly_one_nonempty_payload_required(self):
-        for payload in ({}, {"content": "a", "content_base64": "YQ=="},
-                        {"content": ""}, {"content_base64": ""}):
+    def test_ref_required_and_inline_payloads_rejected(self):
+        self.assertEqual(self.model(file_ref="opaque-ref").file_ref, "opaque-ref")
+        for payload in ({}, {"file_ref": ""}, {"content": "a"},
+                        {"file_ref": "ref", "content_base64": "YQ=="},
+                        {"file_ref": "ref", "content": "a"}):
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
                 self.model(**payload)
-
-    def test_invalid_base64_is_rejected(self):
-        for value in ("data:text/plain;base64,YQ==", "YQ==\n", "%%%", "YQ", "é"):
-            with self.subTest(value=value), self.assertRaises(ValidationError):
-                self.model(content_base64=value)
 
     def test_basename_and_mime_control_characters_are_rejected(self):
         for name in ("../doc.md", "C:\\doc.md", ".", "..", " ", "bad\r\n.md"):
             with self.subTest(name=name), self.assertRaises(ValidationError):
-                attachments.UploadWorkPackageAttachmentInput(
-                    work_package_id=17, file_name=name, content="a"
-                )
+                self.model(file_ref="ref", file_name=name)
         for mime in ("invalid", "text/plain\r\nX: bad"):
             with self.assertRaises(ValidationError):
-                self.model(content="a", content_type=mime)
-
-    def test_decoded_byte_limit_includes_multibyte_utf8(self):
-        with patch("src.tools.attachments.MAX_ATTACHMENT_BYTES", 3):
-            self.assertEqual(self.model(content="交").decoded_content(), "交".encode("utf-8"))
-            with self.assertRaises(ValidationError):
-                self.model(content="交接")
-            with self.assertRaises(ValidationError):
-                self.model(content_base64=base64.b64encode(b"1234").decode("ascii"))
+                self.model(file_ref="ref", content_type=mime)
 
 
 if __name__ == "__main__":

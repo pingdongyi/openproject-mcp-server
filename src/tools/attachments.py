@@ -1,81 +1,42 @@
-"""Attachment tools that transfer content through MCP, including remote servers."""
+"""Attachment tools using references to separate binary HTTP transfers."""
 
-import base64
-import binascii
 import hashlib
 from typing import Annotated, Any, Dict, Optional
 
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from src.client import MAX_ATTACHMENT_BYTES, validate_attachment_filename
+from src.client import validate_attachment_filename
 from src.server import get_client, mcp
+from src.attachment_transfer import (
+    TRANSFER_TTL_SECONDS, register_transfer_routes, store, tool_owner,
+    validate_content_type,
+)
+
+register_transfer_routes(mcp)
 
 PositiveId = Annotated[int, Field(gt=0)]
-MAX_BASE64_LENGTH = 4 * ((MAX_ATTACHMENT_BYTES + 2) // 3)
 
 
 class UploadWorkPackageAttachmentInput(BaseModel):
-    """Provide exactly one UTF-8 text or standard Base64 payload."""
+    """Attach a file previously staged through POST /attachments/uploads."""
 
+    model_config = ConfigDict(extra="forbid")
     work_package_id: PositiveId
-    file_name: str = Field(min_length=1, max_length=255)
-    content: Optional[str] = Field(
-        None,
-        max_length=MAX_ATTACHMENT_BYTES,
-        description="UTF-8 text content; use content_base64 for exact binary bytes.",
-    )
-    content_base64: Optional[str] = Field(
-        None,
-        max_length=MAX_BASE64_LENGTH,
-        description="Standard Base64, without whitespace or a data URL prefix.",
-    )
-    content_type: Optional[str] = Field(
-        None, max_length=255, description="MIME type; inferred from file_name if omitted."
-    )
+    file_ref: str = Field(min_length=1, max_length=128)
+    file_name: Optional[str] = Field(None, min_length=1, max_length=255)
+    content_type: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = Field(None, max_length=10000)
 
     @field_validator("file_name")
     @classmethod
-    def validate_name(cls, value: str) -> str:
-        return validate_attachment_filename(value)
+    def validate_name(cls, value: Optional[str]) -> Optional[str]:
+        return validate_attachment_filename(value) if value is not None else None
 
     @field_validator("content_type")
     @classmethod
     def validate_type(cls, value: Optional[str]) -> Optional[str]:
-        if value is not None and (
-            "/" not in value
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
-        ):
-            raise ValueError(
-                "content_type must be a MIME type without control characters"
-            )
-        return value
-
-    @model_validator(mode="after")
-    def validate_payload(self) -> "UploadWorkPackageAttachmentInput":
-        if (self.content is None) == (self.content_base64 is None):
-            raise ValueError("Provide exactly one of content or content_base64")
-        self.decoded_content()
-        return self
-
-    def decoded_content(self) -> bytes:
-        """Decode strictly and enforce the limit on bytes, rather than characters."""
-        if self.content is not None:
-            try:
-                payload = self.content.encode("utf-8")
-            except UnicodeEncodeError as error:
-                raise ValueError("content must be valid UTF-8 text") from error
-        else:
-            try:
-                payload = base64.b64decode(self.content_base64, validate=True)
-            except (ValueError, binascii.Error) as error:
-                raise ValueError("content_base64 must be valid standard Base64") from error
-        if not payload:
-            raise ValueError("Attachment content must not be empty")
-        if len(payload) > MAX_ATTACHMENT_BYTES:
-            raise ValueError("Attachment content exceeds the 10 MiB limit")
-        return payload
+        return validate_content_type(value) if value is not None else None
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -95,20 +56,23 @@ async def list_work_package_attachments(work_package_id: PositiveId) -> Dict[str
 async def upload_work_package_attachment(
     input: UploadWorkPackageAttachmentInput,
 ) -> Dict[str, Any]:
-    """Upload an actual attachment to an existing ticket using text or Base64.
+    """Attach a staged binary file to an existing ticket.
 
-    No server-local file path is needed. Limited to 10 MiB of decoded content.
-    Requires the ticket's attachment permission. Uploading again creates another
-    attachment; list existing attachments before retrying an uncertain upload.
-    uploaded_sha256 describes the sent bytes; download to verify stored bytes.
+    First POST raw file bytes to /attachments/uploads?file_name=... on this
+    MCP server with the same bearer token; pass its file_ref here within 15 minutes.
+    File bytes never enter MCP messages. Optional file_name/content_type override
+    the staged metadata. Limited to 10 MiB. Upload is not idempotent: list existing
+    attachments before retrying an uncertain upload. References expire and are
+    process-local; deployments must route requests to the same worker.
     """
     try:
-        payload = input.decoded_content()
+        transfer = store.get(input.file_ref, tool_owner(), "upload")
+        payload = transfer.path.read_bytes()
         attachment = await get_client().upload_work_package_attachment(
             input.work_package_id,
-            input.file_name,
+            input.file_name or transfer.file_name,
             payload,
-            content_type=input.content_type,
+            content_type=input.content_type or transfer.content_type,
             description=input.description,
         )
         return {
@@ -130,29 +94,37 @@ async def get_attachment(attachment_id: PositiveId) -> Dict[str, Any]:
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
-async def download_attachment(
-    attachment_id: PositiveId, include_content: bool = True,
-) -> Dict[str, Any]:
-    """Download up to 10 MiB as Base64 with a SHA-256 of the stored bytes.
+async def download_attachment(attachment_id: PositiveId) -> Dict[str, Any]:
+    """Prepare a binary HTTP download and return its path, size and SHA-256.
 
-    Set include_content=false for size/hash verification without a large MCP
-    result. The file is still downloaded and hashed; no server-local file is saved.
+    GET download_path relative to this MCP server's HTTP base URL with the same
+    bearer token within 15 minutes. No file contents are returned through MCP.
+    Limited to 10 MiB. Temporary downloads are process-local.
     """
+    reference = None
     try:
         client = get_client()
         metadata = await client.get_attachment(attachment_id)
+        file_name = validate_attachment_filename(metadata.get("fileName") or f"attachment-{attachment_id}")
+        content_type = validate_content_type(metadata.get("contentType") or "application/octet-stream")
         payload = await client.download_attachment(attachment_id)
-        result = {
+        reference, transfer = store.create(file_name, content_type, tool_owner(), "download")
+        transfer.path.write_bytes(payload)
+        transfer.size_bytes = len(payload)
+        transfer.sha256 = hashlib.sha256(payload).hexdigest()
+        return {
             "attachment_id": attachment_id,
-            "file_name": metadata.get("fileName"),
-            "content_type": metadata.get("contentType"),
-            "size_bytes": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
+            "file_name": file_name,
+            "content_type": content_type,
+            "size_bytes": transfer.size_bytes,
+            "sha256": transfer.sha256,
+            "file_ref": reference,
+            "download_path": f"/attachments/downloads/{reference}",
+            "expires_in_seconds": TRANSFER_TTL_SECONDS,
         }
-        if include_content:
-            result["content_base64"] = base64.b64encode(payload).decode("ascii")
-        return result
     except Exception as error:
+        if reference is not None:
+            store.discard(reference)
         raise ToolError(f"Failed to download attachment: {error}") from error
 
 
