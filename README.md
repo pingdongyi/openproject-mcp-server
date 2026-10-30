@@ -356,6 +356,28 @@ Each user connects with their Bearer token (e.g., `Authorization: Bearer key1`).
 MCP_HTTP_PORT=9000
 ```
 
+Compose publishes the port on `127.0.0.1` for a reverse proxy on the same host.
+For Caddy forwarding to `127.0.0.1:8002`, set:
+
+```env
+MCP_HTTP_PORT=8002
+FORWARDED_ALLOW_IPS=127.0.0.1,172.22.0.1
+```
+
+Caddy forwards `X-Forwarded-For` and `X-Forwarded-Proto` automatically. Uvicorn
+uses these headers for the logged client IP and URL scheme only when the direct
+peer is trusted. `172.22.0.1` is the Docker gateway observed in this deployment;
+adjust the allowlist if the proxy's source IP changes. Without a forwarded IP,
+the application can only log its direct peer. If Caddy is behind a CDN, configure
+Caddy's trusted upstream proxies as well. For proxies on another host or Docker
+network, adjust the loopback-only port binding and allowlist for that topology.
+
+After changing these environment settings, recreate the container:
+
+```bash
+docker compose up -d --force-recreate openproject-mcp
+```
+
 **Manual Docker build (without compose):**
 
 ```bash
