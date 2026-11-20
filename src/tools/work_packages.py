@@ -1,9 +1,11 @@
 """Work package management tools - Priority CRITICAL tools for 12 users."""
 
 import json
-from typing import Optional
+from typing import Annotated, Optional
+from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
+from src.client import OpenProjectAPIError
 from src.server import mcp, get_client
 from src.utils.formatting import (
     format_work_package_list,
@@ -860,6 +862,27 @@ async def add_work_package_comment(
 
     except Exception as e:
         return format_error(f"Failed to add comment: {str(e)}")
+
+
+@mcp.tool
+async def update_work_package_comment(
+    activity_id: Annotated[int, Field(gt=0, strict=True)],
+    comment: str,
+) -> str:
+    """Replace the text of an existing work package comment.
+
+    Args:
+        activity_id: Activity ID from list_work_package_activities
+        comment: Full replacement text in Markdown. An empty string retracts
+            the comment text and leaves the activity in the audit history.
+    """
+    try:
+        await get_client().update_work_package_comment(activity_id, comment)
+    except (OpenProjectAPIError, ValueError) as error:
+        raise ToolError(str(error)) from error
+
+    action = "retracted" if comment == "" else "updated"
+    return format_success(f"Comment {action} on activity #{activity_id}.")
 
 
 @mcp.tool

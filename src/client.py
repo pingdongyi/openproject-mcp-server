@@ -651,6 +651,25 @@ class OpenProjectClient:
             "POST", f"/work_packages/{work_package_id}/activities", payload
         )
 
+    async def update_work_package_comment(
+        self, activity_id: int, comment: str
+    ) -> Dict:
+        """Replace an activity's existing comment, or retract it with an empty string."""
+        if comment and not comment.strip():
+            raise ValueError("Use an empty string to retract a comment.")
+
+        endpoint = f"/activities/{activity_id}"
+        activity = await self._request("GET", endpoint)
+        if not (activity.get("comment") or {}).get("raw"):
+            raise ValueError(f"Activity #{activity_id} has no comment to edit.")
+
+        result = await self._request("PATCH", endpoint, {"comment": {"raw": comment}})
+        if result.get("id") != activity_id:
+            raise ValueError(
+                f"OpenProject did not confirm the update to activity #{activity_id}."
+            )
+        return result
+
     async def get_work_package_activities(self, work_package_id: int) -> Dict:
         """
         Retrieve activities (comments, changes) for a work package.

@@ -568,6 +568,19 @@ Delete a work package.
 **Parameters:**
 - `work_package_id` (integer, required): Work package ID
 
+#### `update_work_package_comment`
+
+Replace the Markdown on an existing comment. Use the activity ID returned by
+`list_work_package_activities`. The API account needs permission to edit
+that comment.
+
+```json
+{"activity_id": 123, "comment": "Updated progress report."}
+```
+
+Pass an empty string as `comment` to retract the comment text. OpenProject
+retains the activity in its audit history.
+
 ### Advanced Filters 🔍
 
 The following tools provide specialized filtering capabilities for common work package search scenarios. All tools support flexible filtering by project, assignee, priority, and type.
