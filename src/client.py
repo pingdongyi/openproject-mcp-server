@@ -663,7 +663,13 @@ class OpenProjectClient:
         if not (activity.get("comment") or {}).get("raw"):
             raise ValueError(f"Activity #{activity_id} has no comment to edit.")
 
-        result = await self._request("PATCH", endpoint, {"comment": {"raw": comment}})
+        try:
+            result = await self._request("PATCH", endpoint, {"comment": comment})
+        except OpenProjectAPIError as error:
+            if error.status != 400 or error.api_message != "Bad request: comment is invalid":
+                raise
+            # Retry with the documented object form only after validation rejects the string.
+            result = await self._request("PATCH", endpoint, {"comment": {"raw": comment}})
         if result.get("id") != activity_id:
             raise ValueError(
                 f"OpenProject did not confirm the update to activity #{activity_id}."

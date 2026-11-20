@@ -47,7 +47,7 @@ class WorkPackageCommentTests(unittest.IsolatedAsyncioTestCase):
             self.request.await_args_list,
             [
                 call("GET", "/activities/123"),
-                call("PATCH", "/activities/123", {"comment": {"raw": comment}}),
+                call("PATCH", "/activities/123", {"comment": comment}),
             ],
         )
 
@@ -63,7 +63,33 @@ class WorkPackageCommentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Comment retracted on activity #123", result.content[0].text)
         self.request.assert_awaited_with(
-            "PATCH", "/activities/123", {"comment": {"raw": ""}}
+            "PATCH", "/activities/123", {"comment": ""}
+        )
+
+    async def test_uses_the_object_form_after_comment_format_rejection(self):
+        comment = "Updated text"
+        self.request.side_effect = [
+            {"id": 123, "comment": {"raw": "Original"}},
+            OpenProjectAPIError(
+                400,
+                '{"message": "Bad request: comment is invalid"}',
+                "API Error 400",
+            ),
+            {"id": 123, "comment": {"raw": comment}},
+        ]
+
+        result = await self.client.call_tool(
+            "update_work_package_comment", {"activity_id": 123, "comment": comment}
+        )
+
+        self.assertIn("Comment updated on activity #123", result.content[0].text)
+        self.assertEqual(
+            self.request.await_args_list,
+            [
+                call("GET", "/activities/123"),
+                call("PATCH", "/activities/123", {"comment": comment}),
+                call("PATCH", "/activities/123", {"comment": {"raw": comment}}),
+            ],
         )
 
     async def test_rejects_an_activity_without_a_comment(self):
@@ -86,6 +112,8 @@ class WorkPackageCommentTests(unittest.IsolatedAsyncioTestCase):
             await self.client.call_tool(
                 "update_work_package_comment", {"activity_id": 123, "comment": "New text"}
             )
+
+        self.assertEqual(self.request.await_count, 2)
 
     async def test_rejects_invalid_id_and_whitespace_only_text(self):
         for arguments in (
